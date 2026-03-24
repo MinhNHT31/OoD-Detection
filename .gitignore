@@ -6,3 +6,4 @@ VN_data/
 phenikax_dataset/
 Depth-Anything-V2/
 dataset_ObstacleTrack/
+__pycache__/
