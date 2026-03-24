@@ -22,6 +22,7 @@ Luồng xử lý:
                 → List[Detection] sorted by distance_m ASC
 """
 
+import time
 import numpy as np
 import cv2
 import json
@@ -30,7 +31,7 @@ from typing import List, Tuple, Dict, Optional
 
 from core.segmentor import Segmentor
 from core.depth_estimator import DepthEstimator
-from core.geometry_copy import GeometryEngine
+from core.geometry import GeometryEngine
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -195,18 +196,13 @@ class PipelineManager:
 
     def run(self, image_bgr: np.ndarray) -> List[Detection]:
         """
-        Chạy toàn bộ pipeline trên một frame.
-
-        Parameters
-        ----------
-        image_bgr : np.ndarray  shape (H, W, 3) uint8 BGR
-
-        Returns
-        -------
-        List[Detection]  sorted by distance_m ASC
+        Chạy toàn bộ pipeline trên một frame kèm Profiling thời gian.
         """
+        profiling_times = {}
+        total_start = time.perf_counter()
 
         # ── STEP 2: Semantic ──────────────────────────────────────────────────
+        t0 = time.perf_counter()
         print("[Step 2] Semantic segmentation...")
         colored_mask = self.segmentor.predict(
             image_bgr, conf_threshold=self.conf_threshold
@@ -215,48 +211,46 @@ class PipelineManager:
         non_bg_mask  = self._build_non_bg_mask(colored_mask)    # uint8 H×W
         known_masks  = self._build_known_masks(colored_mask)     # dict
         road_mask    = self._build_road_mask(colored_mask)       # bool H×W
+        
+        profiling_times['Step 2 (Semantic & Masks)'] = (time.perf_counter() - t0) * 1000
 
         # ── STEP 3: Depth estimation ──────────────────────────────────────────
+        t0 = time.perf_counter()
         print("[Step 3] Depth estimation...")
-        # DepthEstimator.predict() đã xử lý FOV alignment + metric nội bộ
-        # KHÔNG gọi thêm scale_depth_by_focal_length() — notebook không dùng
         depth_map_real = self.depth_est.predict(image_bgr, K=self.K)  # float32 H×W
+        
+        profiling_times['Step 3 (Depth Estimation)'] = (time.perf_counter() - t0) * 1000
 
         # ── STEP 4: Geometry Engine ───────────────────────────────────────────
+        t0 = time.perf_counter()
         print("[Step 4] Geometry / Surface Normals...")
 
-        # 4.1 Convex Hull lấp lỗ hổng YOLO trên road mask
         alpha_mask = self.geo.get_alpha_shape_mask_cv2(road_mask)   # bool H×W
-
-        # 4.2 Tìm vật cản trong vùng đường (alpha_mask) — đúng như notebook cell 3:
-        #     normal_mask, _ = geo_engine.get_obstacle_mask_normals_numpy(
-        #         depth_map, alpha_mask, angle_thr_deg=60)
         obstacle_flags, _ = self.geo.get_obstacle_mask_normals_numpy(
             depth_map_real, alpha_mask, self.angle_thr_deg
         )                                                            # bool H×W
+        
+        profiling_times['Step 4 (Geometry Engine)'] = (time.perf_counter() - t0) * 1000
 
         # ── STEP 5: Lọc OOD + BBox + Distance ────────────────────────────────
+        t0 = time.perf_counter()
         print("[Step 5] OOD filtering + BBox + Distance...")
 
-        # 5.1 AND(obstacle_flags, non_bg_mask) → loại nhiễu trên nền phẳng
         filtered = (obstacle_flags & (non_bg_mask > 0)).astype(np.uint8) * 255
 
-        # 5.2 Morphology: đóng lỗ hổng nhỏ rồi loại hạt nhiễu
         kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         filtered = cv2.morphologyEx(filtered, cv2.MORPH_CLOSE, kernel)
         filtered = cv2.morphologyEx(filtered, cv2.MORPH_OPEN,  kernel)
 
-        # 5.3 Tách instance bằng connected components
         num_labels, labels_map, stats, _ = cv2.connectedComponentsWithStats(
             filtered, connectivity=8
         )
 
         detections: List[Detection] = []
 
-        for i in range(1, num_labels):   # i=0 là background
+        for i in range(1, num_labels):
             area = int(stats[i, cv2.CC_STAT_AREA])
 
-            # Lọc quá nhỏ và quá lớn — notebook: 500 < area < 50000
             if area < self.MIN_AREA_KNOWN_PX or area > self.MAX_AREA_PX:
                 continue
 
@@ -267,14 +261,11 @@ class PipelineManager:
             bbox          = (x, y, w, h)
             instance_mask = (labels_map == i).astype(np.uint8)
 
-            # 5.4 Gán nhãn: YOLO class hoặc "OOD"
             label = self._match_label(instance_mask, known_masks, area)
 
-            # OOD nhỏ → bỏ qua (giảm false positive)
             if label == "OOD" and area < self.MIN_AREA_OOD_PX:
                 continue
 
-            # 5.5 Trích xuất khoảng cách (depth percentile 5%)
             dist = self._get_distance(depth_map_real, instance_mask, bbox)
             if dist < 0:
                 continue
@@ -286,8 +277,19 @@ class PipelineManager:
                 mask       = instance_mask,
             ))
 
-        # 5.6 Sắp xếp theo khoảng cách tăng dần (mối nguy gần nhất ở đầu)
         detections.sort(key=lambda d: d.distance_m)
+        profiling_times['Step 5 (Filtering & BBox)'] = (time.perf_counter() - t0) * 1000
+
+        # ── IN BÁO CÁO THỜI GIAN ─────────────────────────────────────────────
+        total_time = (time.perf_counter() - total_start) * 1000
+        print(f"\n{'='*50}")
+        print(f"⏱️  PIPELINE TIMING REPORT (ms)")
+        print(f"{'-'*50}")
+        for step_name, t_ms in profiling_times.items():
+            print(f"{step_name:<28} : {t_ms:>7.2f} ms")
+        print(f"{'-'*50}")
+        print(f"{'TOTAL PIPELINE':<28} : {total_time:>7.2f} ms ({1000/total_time:.2f} FPS)")
+        print(f"{'='*50}\n")
 
         print(f"[PipelineManager] Kết quả: {len(detections)} vật thể "
               f"({sum(1 for d in detections if d.label == 'OOD')} OOD)")
@@ -507,14 +509,14 @@ if __name__ == "__main__":
         depth_weight  = "weights/depth_anything_v2_metric_vkitti_vits.pth",
         K             = K,
         E_v2c         = E_v2c,
-        device        = "cpu",
+        device        = "cuda",
         max_depth     = 60.0,
-        angle_thr_deg = 60.0,
+        angle_thr_deg = 50.0,
         conf_threshold= 0.2,   # notebook cell 1: conf_threshold=0.2
     )
 
     # ── Load ảnh ─────────────────────────────────────────────────────────────
-    IMG_PATH = "dataset_ObstacleTrack/images/validation_40.webp"
+    IMG_PATH = "datasets/dataset_ObstacleTrack/images/validation_40.webp"
     image = _cv2.imread(IMG_PATH)
     assert image is not None, f"Không đọc được ảnh: {IMG_PATH}"
 
