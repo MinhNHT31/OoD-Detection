@@ -29,7 +29,7 @@ class Segmentor:
             r, g, b = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
             self.bgr_colors[cls] = (b, g, r) # OpenCV dùng BGR
             
-        print(f"[Segmentor] Loaded YOLO model từ {weight_path}")
+        # print(f"[Segmentor] Loaded YOLO model từ {weight_path}")
 
     def predict(self, image_bgr: np.ndarray, conf_threshold: float = 0.4) -> np.ndarray:
         """
@@ -43,14 +43,14 @@ class Segmentor:
 
         results = self.model(image_bgr, conf=conf_threshold, verbose=False)
         for result in results:
-            print(f"[Segmentor] Phát hiện {len(result.boxes)} đối tượng với conf >= {conf_threshold}")
+            # print(f"[Segmentor] Phát hiện {len(result.boxes)} đối tượng với conf >= {conf_threshold}")
             if result.masks is None: continue
             names = result.names
             
             for i, cls_id in enumerate(result.boxes.cls.cpu().numpy().astype(int)):
                 cls_name = names.get(cls_id, "").lower()
                 conf_score = result.boxes.conf[i]
-                print(f"[Segmentor] Phát hiện: {cls_name} (ID: {cls_id}) - Conf: {conf_score:.2f}")
+                # print(f"[Segmentor] Phát hiện: {cls_name} (ID: {cls_id}) - Conf: {conf_score:.2f}")
                 
                 # 2. Kiểm tra xem class này có trong color_map không
                 if cls_name in self.bgr_colors:

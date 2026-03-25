@@ -42,7 +42,7 @@ class DepthEstimator:
         if self.device_type == "cuda":
             torch.backends.cudnn.benchmark = True
             
-        print(f"[DepthEstimator] Loaded Metric Depth ({self.encoder}) trên {self.device} (AMP Enabled)")
+        # print(f"[DepthEstimator] Loaded Metric Depth ({self.encoder}) trên {self.device} (AMP Enabled)")
 
     def _detect_encoder(self, weight_path: str) -> str:
         name = Path(weight_path).stem.lower()
