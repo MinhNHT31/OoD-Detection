@@ -10,6 +10,7 @@ import time
 import numpy as np
 import cv2
 import json
+import torch
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional
 
@@ -125,53 +126,56 @@ class PipelineManager:
                 best_label = cls_name
         return best_label
 
-    def run(self, image_bgr: np.ndarray) -> List[Detection]:
-        profiling_times = {}
+    def run(self, image_bgr: np.ndarray) -> Tuple[List[Detection], Dict[str, float]]:
+        p = {} # Dictionary lưu trữ timing chi tiết
         total_start = time.perf_counter()
 
-        # ── AUTO-CALIBRATION ─────────────────────
+        # ── STEP 1: PRE-PROCESS ──
+        t0 = time.perf_counter()
         if self.geo is None:
             orig_H, orig_W = image_bgr.shape[:2]
             target_W, target_H = self.target_size
-            
             self.scale_x = target_W / orig_W
             self.scale_y = target_H / orig_H
-            
             self.K_scaled = self.K_orig.copy()
             self.K_scaled[0, :] *= self.scale_x  
             self.K_scaled[1, :] *= self.scale_y  
-            
             self.geo = GeometryEngine(self.K_scaled, self.E_v2c, self.device)
 
-        # ── TIỀN XỬ LÝ RESIZE ─────────────────────────────────────────────────
         img_infer = cv2.resize(image_bgr, self.target_size, interpolation=cv2.INTER_LINEAR)
+        p['Step 1: Resize & Calib'] = (time.perf_counter() - t0) * 1000
 
-        # ── STEP 2: Semantic ──────────────────────────────────────────────────
+        # ── STEP 2: SEMANTIC (YOLO) ──
         t0 = time.perf_counter()
         colored_mask = self.segmentor.predict(img_infer, conf_threshold=self.conf_threshold)
-        non_bg_mask  = self._build_non_bg_mask(colored_mask)
-        known_masks  = self._build_known_masks(colored_mask)
-        road_mask    = self._build_road_mask(colored_mask)
-        profiling_times['Step 2 (Semantic)'] = (time.perf_counter() - t0) * 1000
+        # Bắt buộc đồng bộ để đo GPU chuẩn (đặc biệt quan trọng với RTX 5090)
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        p['Step 2a: YOLO Inference'] = (time.perf_counter() - t0) * 1000
 
-        # ── STEP 3: Depth estimation ──────────────────────────────────────────
+        t0 = time.perf_counter()
+        non_bg_mask = self._build_non_bg_mask(colored_mask)
+        known_masks = self._build_known_masks(colored_mask)
+        road_mask   = self._build_road_mask(colored_mask)
+        p['Step 2b: Mask Build (CPU)'] = (time.perf_counter() - t0) * 1000
+
+        # ── STEP 3: DEPTH ESTIMATION ──
         t0 = time.perf_counter()
         depth_map_real = self.depth_est.predict(img_infer, K=self.K_scaled)
-        profiling_times['Step 3 (Depth)'] = (time.perf_counter() - t0) * 1000
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        p['Step 3: Depth Inference'] = (time.perf_counter() - t0) * 1000
 
-        # CACHE LẠI ĐỂ DÙNG CHO HÀM VISUALIZE
         self.last_colored_mask = colored_mask
         self.last_depth_map = depth_map_real
 
-        # ── STEP 4: Geometry Engine ───────────────────────────────────────────
+        # ── STEP 4: GEOMETRY ENGINE ──
         t0 = time.perf_counter()
         alpha_mask = self.geo.get_alpha_shape_mask_cv2(road_mask)
         obstacle_flags, _ = self.geo.get_obstacle_mask_normals_numpy(
             depth_map_real, alpha_mask, self.angle_thr_deg
         )
-        profiling_times['Step 4 (Geometry)'] = (time.perf_counter() - t0) * 1000
+        p['Step 4: Geometry (CPU/NP)'] = (time.perf_counter() - t0) * 1000
 
-        # ── STEP 5: Lọc OOD + BBox + Distance ────────────────────────────────
+        # ── STEP 5: FILTERING & BINDING ──
         t0 = time.perf_counter()
         filtered = (obstacle_flags & (non_bg_mask > 0)).astype(np.uint8) * 255
         kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
@@ -192,43 +196,37 @@ class PipelineManager:
 
             x, y, w, h = (int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP]),
                           int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_HEIGHT]))
-            bbox_infer = (x, y, w, h)
-            instance_mask = (labels_map == i).astype(np.uint8)
+            
+            # ROI trích xuất an toàn
+            y_lower = y + h // 2
+            roi_depth = depth_map_real[y_lower:y+h, x:x+w]
+            inst_mask_roi = (labels_map[y_lower:y+h, x:x+w] == i)
+            
+            # Tránh lỗi IndexError khi mảng rỗng
+            if roi_depth.size == 0 or not np.any(inst_mask_roi): continue
+            
+            valid_pts = roi_depth[inst_mask_roi]
+            valid_pts = valid_pts[(valid_pts > self.MIN_DEPTH_M) & (valid_pts < self.MAX_DEPTH_M)]
+            
+            if valid_pts.size == 0: continue
 
-            label = self._match_label(instance_mask, known_masks, area)
+            label = self._match_label((labels_map == i), known_masks, area)
             if label == "OOD" and area < min_area_ood: continue
 
-            dist = self._get_distance(depth_map_real, instance_mask, bbox_infer)
-            if dist < 0: continue
-
-            orig_bbox = (
-                int(x / self.scale_x),
-                int(y / self.scale_y),
-                int(w / self.scale_x),
-                int(h / self.scale_y)
-            )
+            dist = float(np.min(valid_pts))
+            orig_bbox = (int(x / self.scale_x), int(y / self.scale_y), 
+                         int(w / self.scale_x), int(h / self.scale_y))
 
             detections.append(Detection(
-                label      = label,
-                bbox       = orig_bbox,
-                distance_m = round(dist, 2),
-                mask       = instance_mask, 
+                label=label, bbox=orig_bbox, distance_m=round(dist, 2), mask=(labels_map == i)
             ))
 
         detections.sort(key=lambda d: d.distance_m)
-        profiling_times['Step 5 (Filtering)'] = (time.perf_counter() - t0) * 1000
+        p['Step 5: Post-Process (CPU)'] = (time.perf_counter() - t0) * 1000
 
-        # ── IN BÁO CÁO MODULES ─────────────────────────────────────────────
-        total_time = (time.perf_counter() - total_start) * 1000
-        print(f"\n{'='*50}")
-        print(f"⏱️  MODULES TIMING ({self.target_size[0]}x{self.target_size[1]})")
-        print(f"{'-'*50}")
-        for step_name, t_ms in profiling_times.items(): print(f"{step_name:<28} : {t_ms:>7.2f} ms")
-        print(f"{'-'*50}")
-        print(f"{'Sum of Modules':<28} : {total_time:>7.2f} ms")
-        print(f"{'='*50}\n")
-
-        return detections
+        # KEY QUAN TRỌNG ĐỂ FIX LỖI BENCHMARK
+        p['TOTAL_LATENCY'] = (time.perf_counter() - total_start) * 1000
+        return detections, p
 
 # ──────────────────────────────────────────────────────────────────────────────
 # VISUALIZATION & EXPORT
@@ -348,7 +346,7 @@ def visualize(
 
     plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
     print(f"[Visualize] Đã lưu → {save_path}")
-    plt.show()
+    # plt.show()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # USAGE EXAMPLE
@@ -386,14 +384,32 @@ if __name__ == "__main__":
     image = cv2.imread(IMG_PATH)
     assert image is not None, f"Không đọc được ảnh: {IMG_PATH}"
 
+    import torch
+    print("\n" + "="*50)
+    print(f"🔥 KIỂM TRA PHẦN CỨNG: PyTorch đang chạy trên card: {torch.cuda.get_device_name(pipeline.device)}")
+    print("="*50 + "\n")
+
+    print("⏳ Đang khởi động (Warmup) các mô hình AI...")
+    _ = pipeline.run(image)
+
+    print("\n🚀 BẮT ĐẦU ÉP XUNG GPU (Chạy liên tục 100 lần để quan sát trên nvitop)...")
+    
+    # Chạy vòng lặp 100 lần để giữ chương trình sống đủ lâu
+    for i in range(100):
+        _,_ = pipeline.run(image)
+        print(f"Đang xử lý Frame {i+1}/100...")
+
+    print("\n✅ Đã hoàn thành 100 frames!")
+
     print("\n⏳ Đang khởi động (Warmup) các mô hình AI...")
     _ = pipeline.run(image)
 
     print("\n🚀 BẮT ĐẦU ĐO LƯỜNG THỰC TẾ...")
     total_prog_start = time.perf_counter()
     
-    # Chạy thực tế một lần duy nhất
-    detections = pipeline.run(image)
+    # Sửa dòng: detections = pipeline.run(image)
+    # Thành:
+    detections, p = pipeline.run(image) # Tách rõ 2 biến
     
     # Tính tổng thời gian hệ thống End-to-End
     total_prog_time = (time.perf_counter() - total_prog_start) * 1000
@@ -405,19 +421,20 @@ if __name__ == "__main__":
         print(f"  [{d.label:8s}]  bbox={d.bbox}  dist={d.distance_m:.2f}m")
     print(f"{'─'*50}")
     
-    # ĐÂY LÀ CHỈ SỐ FPS CHUẨN XÁC NHẤT
-    print(f"  ⏱️ TỔNG THỜI GIAN END-TO-END: {total_prog_time:.2f} ms ({1000/total_prog_time:.2f} FPS)")
-    print(f"{'─'*50}\n")
-
+    # In luôn bảng Profiling chi tiết ra màn hình
+    from pprint import pprint
+    print("⏱️ THỜI GIAN CHI TIẾT TỪNG BƯỚC:")
+    pprint(p)
+    
     # Lấy luôn kết quả đã lưu trong pipeline, KHÔNG CHẠY LẠI MÔ HÌNH!
     colored_mask = pipeline.last_colored_mask
     depth_raw    = pipeline.last_depth_map
     depth_map    = pipeline.geo.scale_depth_by_focal_length(depth_raw)
 
-    visualize(
-        image_bgr    = image,
-        colored_mask = colored_mask,
-        depth_map    = depth_map,
-        detections   = detections,
-        save_path    = "output_detection_924x518.jpg",
-    )
+    # visualize(
+    #     image_bgr    = image,
+    #     colored_mask = colored_mask,
+    #     depth_map    = depth_map,
+    #     detections   = detections,
+    #     save_path    = "output_detection_924x518.jpg",
+    # )
